@@ -1172,6 +1172,26 @@ static HRESULT D3D11CreateDeviceHook(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER
 	return hr;
 }
 
+// a device on CEF's adapter that keeps its shared textures as they are (DUI windows without a D3D11 game device),
+// made through D3D11CoreCreateDevice like above: D3D11CreateDevice goes through the hooked D3D11CreateDeviceAndSwapChain
+HRESULT CreateUnhookedD3D11Device(ID3D11Device** device, ID3D11DeviceContext** context)
+{
+	static auto D3D11CoreCreateDevice = (HRESULT(WINAPI*)(IDXGIFactory*, IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**, D3D_FEATURE_LEVEL*))GetProcAddress(g_sysD3D11, "D3D11CoreCreateDevice");
+	static const D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
+
+	WRL::ComPtr<IDXGIAdapter> adapter;
+	PatchAdapter(adapter.GetAddressOf());
+
+	HRESULT hr = (D3D11CoreCreateDevice) ? D3D11CoreCreateDevice(nullptr, adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, &featureLevel, 1, D3D11_SDK_VERSION, device, nullptr) : E_FAIL;
+
+	if (SUCCEEDED(hr))
+	{
+		(*device)->GetImmediateContext(context);
+	}
+
+	return hr;
+}
+
 static HRESULT (*g_origD3D11CreateDeviceMain)(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, _In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, _COM_Outptr_opt_ ID3D11Device** ppDevice, _Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel, _COM_Outptr_opt_ ID3D11DeviceContext** ppImmediateContext);
 
 static HRESULT D3D11CreateDeviceHookMain(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, _In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, _COM_Outptr_opt_ ID3D11Device** ppDevice, _Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel, _COM_Outptr_opt_ ID3D11DeviceContext** ppImmediateContext)

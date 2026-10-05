@@ -212,4 +212,14 @@ public:
 	void HandlePopupShow(bool show);
 
 	bool IsFixedSizeWindow() const;
+
+private:
+	bool UsesFlipDevice() const;
+
+	void FlipFrame();
+
+	// CEF's newest texture until FlipFrame takes it, and the one it flips from
+	std::atomic<HANDLE> m_flipSourceHandle = nullptr;
+	HANDLE m_flipSourceOpened = nullptr;
+	Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_flipSource;
 };

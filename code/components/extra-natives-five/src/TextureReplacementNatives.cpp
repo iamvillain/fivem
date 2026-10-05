@@ -11,13 +11,47 @@
 #include <GameInit.h>
 #include <unordered_set>
 
+#ifdef GTA_FIVE
 #define RAGE_FORMATS_GAME five
 #define RAGE_FORMATS_GAME_FIVE
+#endif
 
 #define RAGE_FORMATS_IN_GAME
 #include <gtaDrawable.h>
 #include <fragType.h>
 
+#ifdef IS_RDR3
+// RDR3's strStreamingModule has more methods than Streaming.h declares, FindSlot (by hash) and GetPtr are slots 5 and 12
+static void* GetLoadedAsset(const char* extension, const std::string& name)
+{
+	auto store = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule(extension);
+	auto vtable = *(void***)store;
+
+	uint32_t id = -1;
+	((void(*)(void*, uint32_t*, uint32_t))vtable[5])(store, &id, HashString(name.c_str()));
+
+	return (id != 0xFFFFFFFF) ? ((void*(*)(void*, uint32_t))vtable[12])(store, id) : nullptr;
+}
+
+rage::grcTexture* LookupTexture(const std::string& txd, const std::string& txn)
+{
+	auto textures = (rage::rdr3::pgDictionary<rage::grcTexture>*)GetLoadedAsset("ytd", txd);
+	auto drawable = (rage::rdr3::gtaDrawable*)GetLoadedAsset("ydr", txd);
+
+	// rage::fragType's drawable
+	if (auto fragment = (char*)GetLoadedAsset("yft", txd); !drawable && fragment)
+	{
+		drawable = *(rage::rdr3::gtaDrawable**)(fragment + 0x20);
+	}
+
+	if (!textures && drawable && drawable->GetShaderGroup())
+	{
+		textures = (rage::rdr3::pgDictionary<rage::grcTexture>*)drawable->GetShaderGroup()->GetTextures();
+	}
+
+	return (textures) ? textures->Get(HashString(txn.c_str())) : nullptr;
+}
+#else
 rage::grcTexture* LookupTexture(const std::string& txd, const std::string& txn)
 {
 	streaming::Manager* streaming = streaming::Manager::GetInstance();
@@ -68,6 +102,7 @@ rage::grcTexture* LookupTexture(const std::string& txd, const std::string& txn)
 
 	return nullptr;
 }
+#endif
 
 static std::unordered_set<rage::grcTexture*> texturesToRemove;
 static boost::bimap<std::tuple<std::string, std::string>, std::tuple<std::string, std::string>> g_replaceTxdPairs;
