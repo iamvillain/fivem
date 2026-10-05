@@ -75,12 +75,23 @@ struct GameRenderData
 	}
 };
 
+// texture names are per context, and every WebGL page has its own
+using GameViewTexture = std::pair<EGLContext, GLuint>;
+
+static GameViewTexture GetGameViewTexture(GLuint texture)
+{
+	static auto _eglGetCurrentContext = (decltype(&eglGetCurrentContext))(GetProcAddress(GetModuleHandle(L"libEGL.dll"), "eglGetCurrentContext"));
+	return { _eglGetCurrentContext(), texture };
+}
+
 static GLuint g_curGlTexture;
-static std::set<GLuint> g_backBufferTextures;
+
+// game view textures, and the game render handle they're bound to
+static std::map<GameViewTexture, HANDLE> g_backBufferTextures;
 
 static void BindGameRenderHandle();
 
-static std::map<GLuint, EGLSurface> g_pbuffers;
+static std::map<GameViewTexture, EGLSurface> g_pbuffers;
 
 static void (*g_origglDeleteTextures)(GLsizei n, const GLuint* textures);
 
@@ -88,7 +99,7 @@ static void glDeleteTexturesHook(GLsizei n, const GLuint* textures)
 {
 	for (int i = 0; i < n; i++)
 	{
-		GLuint texture = textures[i];
+		auto texture = GetGameViewTexture(textures[i]);
 		g_backBufferTextures.erase(texture);
 
 		if (g_pbuffers.find(texture) != g_pbuffers.end())
@@ -113,20 +124,15 @@ static void (*g_origglBindTexture)(GLenum target, GLuint texture);
 static void glBindTextureHook(GLenum target, GLuint texture)
 {
 	// this gets called really frequently but do we want to do so here?
-	static HANDLE lastBackbufHandle;
 	static HostSharedData<GameRenderData> handleData(launch::IsSDK() ? "CfxGameRenderHandleFxDK" : "CfxGameRenderHandle");
 
-	if (handleData->handle != lastBackbufHandle)
+	// a game view texture gets a new handle when it's bound again, so in its own context
+	if (auto it = g_backBufferTextures.find(GetGameViewTexture(texture)); target == GL_TEXTURE_2D && it != g_backBufferTextures.end() && it->second != handleData->handle)
 	{
-		lastBackbufHandle = handleData->handle;
+		g_curGlTexture = texture;
 
-		for (auto textureId : g_backBufferTextures)
-		{
-			g_curGlTexture = textureId;
-
-			g_origglBindTexture(GL_TEXTURE_2D, textureId);
-			BindGameRenderHandle();
-		}
+		g_origglBindTexture(GL_TEXTURE_2D, texture);
+		BindGameRenderHandle();
 	}
 
 	if (target == GL_TEXTURE_2D)
@@ -240,14 +246,17 @@ static void BindGameRenderHandle()
 	config,
 	pbuffer_attributes);
 
-	if (g_pbuffers.find(g_curGlTexture) != g_pbuffers.end())
+	auto texture = GetGameViewTexture(g_curGlTexture);
+
+	if (g_pbuffers.find(texture) != g_pbuffers.end())
 	{
-		_eglReleaseTexImage(m_display, g_pbuffers[g_curGlTexture], EGL_BACK_BUFFER);
-		_eglDestroySurface(m_display, g_pbuffers[g_curGlTexture]);
-		g_pbuffers.erase(g_curGlTexture);
+		_eglReleaseTexImage(m_display, g_pbuffers[texture], EGL_BACK_BUFFER);
+		_eglDestroySurface(m_display, g_pbuffers[texture]);
+		g_pbuffers.erase(texture);
 	}
 
-	g_pbuffers.insert({ g_curGlTexture, pbuffer });
+	g_pbuffers.insert({ texture, pbuffer });
+	g_backBufferTextures[texture] = handleData->handle;
 
 	handleData->requested = true;
 
@@ -258,9 +267,13 @@ static void(*g_origglTexParameterf)(GLenum target, GLenum pname, GLfloat param);
 
 static void glTexParameterfHook(GLenum target, GLenum pname, GLfloat param)
 {
+	// the GPU thread interleaves every context's commands, so the texture last seen in glBindTexture may be another one's
+	static auto _glGetIntegerv = (decltype(&glGetIntegerv))(GetProcAddress(GetModuleHandle(L"libGLESv2.dll"), "glGetIntegerv"));
+	_glGetIntegerv(GL_TEXTURE_BINDING_2D, (GLint*)&g_curGlTexture);
+
 	// 'secret' activation sequence
-	static std::map<GLuint, int> stages;
-	int& stage = stages[g_curGlTexture];
+	static std::map<GameViewTexture, int> stages;
+	int& stage = stages[GetGameViewTexture(g_curGlTexture)];
 
 	if (target == GL_TEXTURE_2D && pname == GL_TEXTURE_WRAP_T)
 	{
@@ -307,7 +320,7 @@ static void glTexParameterfHook(GLenum target, GLenum pname, GLfloat param)
 		stage = 0;
 
 		BindGameRenderHandle();
-		g_backBufferTextures.insert(g_curGlTexture);
+		g_backBufferTextures.insert({ GetGameViewTexture(g_curGlTexture), NULL });
 	}
 	else if (stage <= 1)
 	{
@@ -778,7 +791,15 @@ static HRESULT OpenSharedResourceHook(ID3D11Device* device, HANDLE hRes, REFIID 
 		return it->second->QueryInterface(iid, ppRes);
 	}
 
-	return g_origOpenSharedResourceHook(device, hRes, iid, ppRes);
+	HRESULT hr = g_origOpenSharedResourceHook(device, hRes, iid, ppRes);
+
+	// NT handles, like the RDR3 game view's
+	if (WRL::ComPtr<ID3D11Device1> device1; FAILED(hr) && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1))))
+	{
+		hr = device1->OpenSharedResource1(hRes, iid, ppRes);
+	}
+
+	return hr;
 }
 
 static HRESULT (*g_origCreateShaderResourceView)(ID3D11Device* device, ID3D11Resource* resource, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc, ID3D11ShaderResourceView** out);
@@ -916,7 +937,13 @@ void VHook(intptr_t& ref, TFnLeft fn, TFnRight out)
 		return;
 	}
 
+#ifdef IS_RDR3
+	// Chromium makes several devices, and one left unhooked hands out legacy (KMT) share handles that Vulkan can't import;
+	// only devices with the same implementation can share the stored original
+	if (*out && (intptr_t)*out != ref)
+#else
 	if (*out)
+#endif
 	{
 		return;
 	}
