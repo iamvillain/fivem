@@ -15,6 +15,8 @@
 static VkInstance g_vkInstance = nullptr;
 static bool g_enableVulkanValidation = false;
 
+extern void GameView_OnDeviceCreated(VkPhysicalDevice physicalDevice, VkDevice device);
+
 // Function to print the output of the validation layers
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugMessageCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageType, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData)
 {
@@ -277,6 +279,10 @@ static HRESULT vkCreateDeviceHook(VkPhysicalDevice physicalDevice, VkDeviceCreat
 	if (result != VK_SUCCESS)
 	{
 		trace("Vulkan device creation returned: %s\n", ResultToString(result));
+	}
+	else
+	{
+		GameView_OnDeviceCreated(physicalDevice, *pDevice);
 	}
 
 	return result;

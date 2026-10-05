@@ -502,6 +502,8 @@ void SetScissorRect(int x, int y, int z, int w)
 
 static uint64_t** sgaDriver;
 
+extern void GameView_Capture(void* context, rage::sga::Texture* backbuffer, void* nativeBackbuffer);
+
 static void(*origEndDraw)(void*);
 static void WrapEndDraw(void* cxt)
 {
@@ -511,6 +513,11 @@ static void WrapEndDraw(void* cxt)
 	// get swapchain backbuffer
 	void* rt[1];
 	rt[0] = (*(void*(__fastcall**)(__int64))(**(uint64_t**)sgaDriver + g_swapchainBackbufferOffset))(*(uint64_t*)sgaDriver);
+
+	// copy the game frame for the NUI game view before NUI gets drawn on top (driver +0x248 gets a texture's VkImage or
+	// ID3D12Resource, the backbuffer render target keeps its texture at +8)
+	auto backbuffer = *(rage::sga::Texture**)((char*)rt[0] + 8);
+	GameView_Capture(cxt, backbuffer, (*(void*(__fastcall**)(__int64, void*))(**(uint64_t**)sgaDriver + 0x248))(*(uint64_t*)sgaDriver, backbuffer));
 
 	setRTs(cxt, 1, rt, true);
 	setDSs(cxt, nullptr, 0, 0);
