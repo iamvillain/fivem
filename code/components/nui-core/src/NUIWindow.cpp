@@ -23,6 +23,9 @@
 
 #include <CefOverlay.h>
 
+#include <d3d11_1.h>
+#include <dxgi1_2.h>
+
 extern nui::GameInterface* g_nuiGi;
 
 #include "memdbgon.h"
@@ -79,6 +82,14 @@ NUIWindow::~NUIWindow()
 	if (m_renderBuffer)
 	{
 		delete[] m_renderBuffer;
+	}
+
+	for (HANDLE handle : { m_flipSourceHandle.exchange(nullptr), m_flipSourceOpened })
+	{
+		if (handle)
+		{
+			CloseHandle(handle);
+		}
 	}
 
 	Instance<NUIWindowManager>::Get()->RemoveWindow(this);
@@ -389,10 +400,112 @@ void NUIWindow::Initialize(CefString url)
 	}
 }
 
+// without a D3D11 game device (RDR3), DUI windows flip CEF's texture on a device of their own
+bool NUIWindow::UsesFlipDevice() const
+{
+	return !m_rawBlit && !g_nuiGi->GetD3D11Device();
+}
+
+extern HRESULT CreateUnhookedD3D11Device(ID3D11Device** device, ID3D11DeviceContext** context);
+
+static auto& GetFlipDevice()
+{
+	static struct FlipDevice
+	{
+		Microsoft::WRL::ComPtr<ID3D11Device1> device;
+		Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+		Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
+		Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
+		Microsoft::WRL::ComPtr<ID3D11RasterizerState> rasterizer;
+
+		FlipDevice()
+		{
+			Microsoft::WRL::ComPtr<ID3D11Device> baseDevice;
+
+			// the default state culls the quad
+			auto rasterizerDesc = CD3D11_RASTERIZER_DESC(CD3D11_DEFAULT());
+			rasterizerDesc.CullMode = D3D11_CULL_NONE;
+
+			if (SUCCEEDED(CreateUnhookedD3D11Device(&baseDevice, &context)) && SUCCEEDED(baseDevice.As(&device)))
+			{
+				device->CreateVertexShader(quadVS, sizeof(quadVS), nullptr, &vs);
+				device->CreatePixelShader(quadPS, sizeof(quadPS), nullptr, &ps);
+				device->CreateRasterizerState(&rasterizerDesc, &rasterizer);
+			}
+		}
+	} flipDevice;
+
+	return flipDevice;
+}
+
+void NUIWindow::FlipFrame()
+{
+	auto& flip = GetFlipDevice();
+
+	// a new CEF texture: its handle stays open while it's flipped from, so the value can't be reused for another one
+	if (HANDLE handle = m_flipSourceHandle.exchange(nullptr))
+	{
+		Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+
+		if (m_flipSourceOpened)
+		{
+			CloseHandle(m_flipSourceOpened);
+		}
+
+		m_flipSourceOpened = handle;
+		m_flipSource = nullptr;
+
+		if (SUCCEEDED(flip.device->OpenSharedResource1(handle, IID_PPV_ARGS(&texture))))
+		{
+			flip.device->CreateShaderResourceView(texture.Get(), nullptr, &m_flipSource);
+		}
+	}
+
+	if (!m_flipSource || !m_swapRtv)
+	{
+		return;
+	}
+
+	// same pass as UpdateFrame's swap texture: flip, and undo the premultiplied alpha
+	CD3D11_VIEWPORT viewport(0.0f, 0.0f, float(m_width), float(m_height));
+
+	flip.context->OMSetRenderTargets(1, m_swapRtv.GetAddressOf(), nullptr);
+	flip.context->RSSetViewports(1, &viewport);
+	flip.context->RSSetState(flip.rasterizer.Get());
+	flip.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	flip.context->VSSetShader(flip.vs.Get(), nullptr, 0);
+	flip.context->PSSetShader(flip.ps.Get(), nullptr, 0);
+	flip.context->PSSetShaderResources(0, 1, m_flipSource.GetAddressOf());
+	flip.context->Draw(4, 0);
+	flip.context->Flush();
+}
+
 void NUIWindow::InitializeRenderBacking()
 {
 	if (!nui::g_rendererInit)
 	{
+		return;
+	}
+
+	if (UsesFlipDevice())
+	{
+		// the game samples this texture, which stays the same while CEF swaps its own
+		auto& device = GetFlipDevice().device;
+		auto desc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_B8G8R8A8_UNORM, m_width, m_height, 1, 1, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, 1, 0, D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+		Microsoft::WRL::ComPtr<IDXGIResource1> resource;
+		HANDLE sharedHandle = nullptr;
+
+		m_swapRtv = nullptr;
+
+		if (device && SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &m_swapTexture)) && SUCCEEDED(m_swapTexture.As(&resource)) && SUCCEEDED(resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &sharedHandle)))
+		{
+			device->CreateRenderTargetView(m_swapTexture.Get(), nullptr, &m_swapRtv);
+
+			// the game takes ownership of the handle
+			std::lock_guard<std::shared_mutex> _(m_textureMutex);
+			m_nuiTexture = g_nuiGi->CreateTextureFromShareHandle(sharedHandle, m_width, m_height);
+		}
+
 		return;
 	}
 
@@ -480,7 +593,15 @@ void NUIWindow::UpdateSharedResource(void* sharedHandle, uint64_t syncKey, const
 				h = m_popupRect.height;
 			}
 
-			if (!m_rawBlit)
+			if (UsesFlipDevice())
+			{
+				// CEF keeps drawing into this texture without further paints, so UpdateFrame flips it every frame
+				if (HANDLE oldHandle = m_flipSourceHandle.exchange(parentHandle))
+				{
+					CloseHandle(oldHandle);
+				}
+			}
+			else if (!m_rawBlit)
 			{
 				auto oldRef = m_parentTextures[type];
 
@@ -630,6 +751,11 @@ void NUIWindow::UpdateFrame()
 	}
 
 	m_pollQueue.clear();
+
+	if (UsesFlipDevice())
+	{
+		FlipFrame();
+	}
 
 	NUIWindowManager* wm = Instance<NUIWindowManager>::Get();
 	auto texture = GetParentTexture(CefRenderHandler::PaintElementType::PET_VIEW);

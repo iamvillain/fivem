@@ -18,6 +18,8 @@ return function()
 		'components/extra-natives-five/src/RadioDSP.cpp',
 		'components/extra-natives-five/src/NuiAudioSink.cpp',
 		'components/extra-natives-five/src/InputNatives.cpp',
+		'components/extra-natives-five/src/RuntimeAssetNatives.cpp',
+		'components/extra-natives-five/src/TextureReplacementNatives.cpp',
 		'components/gta-core-five/include/GameAudioState.h',
 		'components/extra-natives-five/include/audDspEffect.h',
 	}

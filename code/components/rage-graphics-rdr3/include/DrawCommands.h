@@ -75,6 +75,10 @@ extern GFX_EXPORT GraphicsAPI GetCurrentGraphicsAPI();
 // VK context or D3D12 device
 extern GFX_EXPORT void* GetGraphicsDriverHandle();
 
+// draws that use `orig` show `repl` instead, until removed
+void GFX_EXPORT AddTextureOverride(rage::grcTexture* orig, rage::grcTexture* repl);
+void GFX_EXPORT RemoveTextureOverride(rage::grcTexture* orig);
+
 namespace rage::sga
 {
 class GFX_EXPORT GraphicsContext

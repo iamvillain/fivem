@@ -187,6 +187,10 @@ void PopDrawBlitImShader()
 	popImShaderAndResetParams();
 }
 
+// commands enqueued off the render thread run when it ends its next frame (InvokeRender)
+static std::mutex g_drawCommandsMutex;
+static std::vector<std::tuple<void(*)(uintptr_t, uintptr_t), uintptr_t, uintptr_t>> g_drawCommands;
+
 void EnqueueGenericDrawCommand(void(*cb)(uintptr_t, uintptr_t), uintptr_t* arg1, uintptr_t* arg2)
 {
 	if (!*gtaImShader)
@@ -196,7 +200,8 @@ void EnqueueGenericDrawCommand(void(*cb)(uintptr_t, uintptr_t), uintptr_t* arg1,
 
 	if (!IsOnRenderThread())
 	{
-		assert(!"render");
+		std::lock_guard _(g_drawCommandsMutex);
+		g_drawCommands.emplace_back(cb, *arg1, *arg2);
 	}
 	else
 	{
@@ -476,6 +481,18 @@ static void InvokeRender()
 		OnGrcCreateDevice();
 	});
 
+	decltype(g_drawCommands) drawCommands;
+
+	{
+		std::lock_guard _(g_drawCommandsMutex);
+		drawCommands.swap(g_drawCommands);
+	}
+
+	for (auto [cb, arg1, arg2] : drawCommands)
+	{
+		cb(arg1, arg2);
+	}
+
 	OnPostFrontendRender();
 }
 
@@ -502,9 +519,147 @@ void SetScissorRect(int x, int y, int z, int w)
 
 static uint64_t** sgaDriver;
 
+// shaders keep a texture's view rather than the texture, so overrides recreate the original's view for the replacement
+static std::mutex g_textureOverridesMutex;
+static std::unordered_map<rage::grcTexture*, rage::grcTexture*> g_textureOverrides;
+static std::vector<std::pair<rage::grcTexture*, rage::grcTexture*>> g_pendingViewChanges;
+
+// a copy of a view whose image view (Vulkan) or descriptor (D3D12) got replaced, destroyed once frames using it are done
+struct RetiredView
+{
+	char view[32];
+	uint64_t frame;
+};
+
+static std::vector<RetiredView> g_retiredViews;
+static uint64_t g_viewFrame;
+
+static void CreateView(rage::sga::Texture* texture, rage::sga::Texture* source)
+{
+	rage::sga::TextureViewDesc srvDesc;
+	srvDesc.mipLevels = *((uint8_t*)source + 34);
+	srvDesc.arrayStart = 0;
+	srvDesc.dimension = 4;
+	srvDesc.arraySize = 1;
+
+	auto view = *(char**)((char*)texture + 48);
+
+	RetiredView retired;
+	memcpy(retired.view, view, sizeof(retired.view));
+	retired.frame = g_viewFrame;
+
+	(*(void(__fastcall**)(__int64, void*, void*, const void*))(**(uint64_t**)sgaDriver + 256i64))(*(uint64_t*)sgaDriver, view, source, &srvDesc);
+
+	auto oldImage = *(void**)(retired.view + 24);
+
+	if (oldImage && oldImage != *(void**)(view + 24))
+	{
+		g_retiredViews.push_back(retired);
+	}
+}
+
+static void ApplyPendingViewChanges()
+{
+	std::lock_guard _(g_textureOverridesMutex);
+
+	for (auto [texture, source] : g_pendingViewChanges)
+	{
+		CreateView(texture, source);
+	}
+
+	g_pendingViewChanges.clear();
+
+	g_viewFrame++;
+
+	while (!g_retiredViews.empty() && g_viewFrame - g_retiredViews.front().frame > 8)
+	{
+		(*(void(__fastcall**)(__int64, void*))(**(uint64_t**)sgaDriver + 432i64))(*(uint64_t*)sgaDriver, g_retiredViews.front().view);
+		g_retiredViews.erase(g_retiredViews.begin());
+	}
+}
+
+void AddTextureOverride(rage::grcTexture* orig, rage::grcTexture* repl)
+{
+	std::lock_guard _(g_textureOverridesMutex);
+	g_textureOverrides[orig] = repl;
+	g_pendingViewChanges.emplace_back(orig, repl);
+}
+
+void RemoveTextureOverride(rage::grcTexture* orig)
+{
+	std::lock_guard _(g_textureOverridesMutex);
+
+	if (g_textureOverrides.erase(orig))
+	{
+		g_pendingViewChanges.emplace_back(orig, orig);
+	}
+}
+
+// an HD texture (e.g. from a '+hifr' dictionary) streaming in or out swaps contents, view included, with the original,
+// so overridden views are recreated right away, before a frame draws the swapped in image
+static void SwapTextures(void* driver, rage::grcTexture* left, rage::grcTexture* right)
+{
+	// held over the swap too, so views don't change hands while one is being recreated
+	std::lock_guard _(g_textureOverridesMutex);
+
+	(*(void(__fastcall**)(void*, void*, void*))(*(uint64_t*)driver + 0x758))(driver, left, right);
+
+	for (auto [orig, repl] : g_textureOverrides)
+	{
+		if (orig == left || orig == right || repl == left || repl == right)
+		{
+			CreateView(orig, repl);
+		}
+	}
+}
+
+// while an HD texture fades in, its view is rewritten in place with clamped mip levels (D3D12), dropping an override
+static void SetTextureMinLod(void* driver, void* context, rage::grcTexture* texture, float minLod)
+{
+	{
+		std::lock_guard _(g_textureOverridesMutex);
+
+		if (g_textureOverrides.find(texture) != g_textureOverrides.end())
+		{
+			return;
+		}
+	}
+
+	(*(void(__fastcall**)(void*, void*, rage::grcTexture*, float))(*(uint64_t*)driver + 0x760))(driver, context, texture, minLod);
+}
+
+static void(*g_origDestroyTexture)(rage::grcTexture*);
+
+static void DestroyTextureHook(rage::grcTexture* texture)
+{
+	{
+		std::lock_guard _(g_textureOverridesMutex);
+
+		g_pendingViewChanges.erase(std::remove_if(g_pendingViewChanges.begin(), g_pendingViewChanges.end(), [texture](const auto& change)
+		{
+			return change.first == texture || change.second == texture;
+		}), g_pendingViewChanges.end());
+
+		for (auto it = g_textureOverrides.begin(); it != g_textureOverrides.end();)
+		{
+			// an original whose replacement is gone gets its own image back
+			if (it->second == texture && it->first != texture)
+			{
+				g_pendingViewChanges.emplace_back(it->first, it->first);
+			}
+
+			it = (it->first == texture || it->second == texture) ? g_textureOverrides.erase(it) : std::next(it);
+		}
+	}
+
+	g_origDestroyTexture(texture);
+}
+
 static void(*origEndDraw)(void*);
 static void WrapEndDraw(void* cxt)
 {
+	ApplyPendingViewChanges();
+
 	// pattern near vtbl call: 4C 8B 46 08 44 0F  B7 4E 1A 48 8B 0C F8 (non-inlined in new)
 	(*(void(__fastcall**)(__int64, void*))(**(uint64_t**)sgaDriver + 0x328))(*(uint64_t*)sgaDriver, cxt);
 
@@ -578,6 +733,11 @@ namespace rage::sga
 	void Driver_Destroy_Texture(rage::sga::Texture* texture)
 	{
 		(*(void(__fastcall**)(__int64, void*))(**(uint64_t**)sgaDriver + 440i64))(*(uint64_t*)sgaDriver, texture);
+	}
+
+	void Driver_Swap_Textures(rage::sga::Texture* left, rage::sga::Texture* right)
+	{
+		SwapTextures(*sgaDriver, static_cast<rage::grcTexture*>(left), static_cast<rage::grcTexture*>(right));
 	}
 
 	GraphicsContext* GraphicsContext::GetCurrent()
@@ -690,6 +850,23 @@ static HookFunction hookFunction([]()
 
 	MH_Initialize();
 	MH_CreateHook(hook::get_pattern("48 8B CB E8 ? ? ? ? 48 8B 0D ? ? ? ? 0F 57 ED", -0x1D), WrapEndDraw, (void**)&origEndDraw);
+
+	// a texture's last reference released: destroys its view, its image and the texture
+	MH_CreateHook(hook::get_pattern("48 8B 53 30 48 85 D2 74 10 48 8B 0D ? ? ? ? 48 8B 01 FF 90 B0 01 00 00", -0x9C), DestroyTextureHook, (void**)&g_origDestroyTexture);
+
+	// the driver call swapping a texture with its HD version
+	{
+		auto location = hook::get_pattern("48 8B 0D ? ? ? ? 48 8B 01 FF 90 58 07 00 00 80 7B 14 00", 10);
+		hook::nop(location, 6);
+		hook::call(location, SwapTextures);
+	}
+
+	// the driver call clamping a texture's mip levels
+	{
+		auto location = hook::get_pattern("4C 8B 04 F3 4A 8B 14 12 41 FF 91 60 07 00 00", 8);
+		hook::nop(location, 7);
+		hook::call(location, SetTextureMinLod);
+	}
 
 	g_sgaGraphicsContextOffset = *hook::get_pattern<uint32_t>("48 8B 0C D8 48 8B 14 0E 41 C6 40 18 00 C6 82", -21);
 

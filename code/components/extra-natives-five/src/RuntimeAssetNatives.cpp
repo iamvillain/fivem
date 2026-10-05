@@ -9,8 +9,10 @@
 
 #include <CrossBuildRuntime.h>
 
+#ifdef GTA_FIVE
 #define RAGE_FORMATS_GAME five
 #define RAGE_FORMATS_GAME_FIVE
+#endif
 
 #define RAGE_FORMATS_IN_GAME
 #include <gtaDrawable.h>
@@ -21,6 +23,7 @@
 #include <VFSWin32.h>
 
 #include <grcTexture.h>
+#include <DrawCommands.h>
 
 #include <RageParser.h>
 
@@ -51,10 +54,30 @@
 
 using Microsoft::WRL::ComPtr;
 
-static hook::cdecl_stub<rage::five::pgDictionary<rage::grcTexture>*(void*, int)> textureDictionaryCtor([]()
+using TextureDictionary = rage::RAGE_FORMATS_GAME::pgDictionary<rage::grcTexture>;
+
+static hook::cdecl_stub<TextureDictionary*(void*, int)> textureDictionaryCtor([]()
 {
+#ifdef IS_RDR3
+	return hook::get_call(hook::get_pattern("BA 01 00 00 00 48 8B C8 E8 ? ? ? ? 48 8B F0 EB 03 48 8B F5", 8));
+#else
 	return hook::get_call(hook::get_pattern("E8 ? ? ? ? 48 8B F8 EB 02 33 FF 4C 8D 3D"));
+#endif
 });
+
+static rage::grcTexture* CreateImage(int width, int height, const void* pixelData)
+{
+	rage::grcTextureReference reference;
+	memset(&reference, 0, sizeof(reference));
+	reference.width = width;
+	reference.height = height;
+	reference.depth = 1;
+	reference.stride = width * 4;
+	reference.format = 11; // should correspond to DXGI_FORMAT_B8G8R8A8_UNORM
+	reference.pixelData = (uint8_t*)pixelData;
+
+	return rage::grcTextureFactory::getInstance()->createImage(&reference, nullptr);
+}
 
 class RuntimeTex
 {
@@ -103,6 +126,11 @@ private:
 	std::vector<uint8_t> m_backingPixels;
 
 	bool m_owned = false;
+
+#ifdef IS_RDR3
+	// the texture whose image m_texture shows, see Commit
+	rage::grcTexture* m_swappedTexture = nullptr;
+#endif
 };
 
 class RuntimeTxd
@@ -125,12 +153,17 @@ private:
 
 	std::unordered_map<std::string, std::shared_ptr<RuntimeTex>> m_textures;
 
-	rage::five::pgDictionary<rage::grcTexture>* m_txd = nullptr;
+	TextureDictionary* m_txd = nullptr;
 };
 
 RuntimeTex::RuntimeTex(const char* name, int width, int height)
 	: m_owned(true)
 {
+#ifdef IS_RDR3
+	m_pitch = width * 4;
+	m_backingPixels.resize(size_t(m_pitch) * height);
+	m_texture = CreateImage(width, height, m_backingPixels.data());
+#else
 	rage::grcManualTextureDef textureDef;
 	memset(&textureDef, 0, sizeof(textureDef));
 	textureDef.isStaging = 1;
@@ -151,6 +184,7 @@ RuntimeTex::RuntimeTex(const char* name, int width, int height)
 
 		m_texture->Unmap(&lockedTexture);
 	}
+#endif
 }
 
 RuntimeTex::RuntimeTex(rage::grcTexture* texture, const void* data, size_t size)
@@ -227,6 +261,10 @@ bool RuntimeTex::SetPixelData(const void* data, size_t length)
 		return false;
 	}
 
+#ifdef IS_RDR3
+	memcpy(m_backingPixels.data(), data, length);
+	Commit();
+#else
 	rage::grcLockedTexture lockedTexture;
 
 	if (m_texture->Map(0, 0, &lockedTexture, rage::grcLockFlags::WriteDiscard))
@@ -235,12 +273,36 @@ bool RuntimeTex::SetPixelData(const void* data, size_t length)
 		memcpy(m_backingPixels.data(), data, length);
 		m_texture->Unmap(&lockedTexture);
 	}
+#endif
 
 	return true;
 }
 
 void RuntimeTex::Commit()
 {
+#ifdef IS_RDR3
+	// textures can't be mapped: a new one's image gets swapped in on the render thread, the way higher detail versions
+	// stream in, and like those it's swapped back out before the texture is released
+	if (auto texture = (m_texture && !m_backingPixels.empty()) ? CreateImage(GetWidth(), GetHeight(), m_backingPixels.data()) : nullptr)
+	{
+		uintptr_t self = uintptr_t(this), newTexture = uintptr_t(texture);
+
+		EnqueueGenericDrawCommand([](uintptr_t self, uintptr_t newTexture)
+		{
+			auto tex = (RuntimeTex*)self;
+
+			if (tex->m_swappedTexture)
+			{
+				rage::sga::Driver_Swap_Textures(tex->m_texture, tex->m_swappedTexture);
+				delete tex->m_swappedTexture;
+			}
+
+			tex->m_swappedTexture = (rage::grcTexture*)newTexture;
+			rage::sga::Driver_Swap_Textures(tex->m_texture, tex->m_swappedTexture);
+		},
+		&self, &newTexture);
+	}
+#else
 	rage::grcLockedTexture lockedTexture;
 
 	if (m_texture && m_texture->Map(0, 0, &lockedTexture, rage::grcLockFlags::WriteDiscard))
@@ -248,6 +310,7 @@ void RuntimeTex::Commit()
 		memcpy(lockedTexture.pBits, m_backingPixels.data(), m_backingPixels.size());
 		m_texture->Unmap(&lockedTexture);
 	}
+#endif
 }
 
 RuntimeTxd::RuntimeTxd(const char* name)
@@ -261,7 +324,14 @@ void RuntimeTxd::EnsureTxd()
 	streaming::Manager* streaming = streaming::Manager::GetInstance();
 	auto txdStore = streaming->moduleMgr.GetStreamingModule("ytd");
 
+#ifdef IS_RDR3
+	txdStore->FindSlotFromHashKey(&m_txdIndex, HashString(m_name.c_str()));
+
+	// RDR3's strStreamingModule has more methods than Streaming.h declares, SetResource and AddRef are slots 11 and 20
+	auto vtable = *(void***)txdStore;
+#else
 	txdStore->FindSlotFromHashKey(&m_txdIndex, m_name.c_str());
+#endif
 
 	if (m_txdIndex != 0xFFFFFFFF)
 	{
@@ -269,17 +339,25 @@ void RuntimeTxd::EnsureTxd()
 
 		if (!entry.handle)
 		{
-			void* memoryStub = rage::GetAllocator()->Allocate(sizeof(rage::five::pgDictionary<rage::grcTexture>), 16, 0);
+			void* memoryStub = rage::GetAllocator()->Allocate(sizeof(TextureDictionary), 16, 0);
 			m_txd = textureDictionaryCtor(memoryStub, 1);
 
 			streaming::strAssetReference ref;
 			ref.asset = m_txd;
 
+#ifdef IS_RDR3
+			((void(*)(void*, uint32_t, streaming::strAssetReference*))vtable[11])(txdStore, m_txdIndex, &ref);
+#else
 			txdStore->SetResource(m_txdIndex, ref);
+#endif
 			entry.flags = (512 << 8) | 1;
 			entry.flags |= (0x20000000); // SetDoNotDefrag
 
+#ifdef IS_RDR3
+			((void(*)(void*, uint32_t))vtable[20])(txdStore, m_txdIndex);
+#else
 			txdStore->AddRef(m_txdIndex);
+#endif
 		}
 	}
 }
@@ -470,16 +548,7 @@ std::shared_ptr<RuntimeTex> RuntimeTxd::CreateTextureFromImage(const char* name,
 
 		if (SUCCEEDED(hr))
 		{
-			rage::grcTextureReference reference;
-			memset(&reference, 0, sizeof(reference));
-			reference.width = width;
-			reference.height = height;
-			reference.depth = 1;
-			reference.stride = width * 4;
-			reference.format = 11; // should correspond to DXGI_FORMAT_B8G8R8A8_UNORM
-			reference.pixelData = (uint8_t*)pixelData.get();
-
-			auto tex = std::make_shared<RuntimeTex>(rage::grcTextureFactory::getInstance()->createImage(&reference, nullptr), pixelData.get(), width * height * 4);
+			auto tex = std::make_shared<RuntimeTex>(CreateImage(width, height, pixelData.get()), pixelData.get(), width * height * 4);
 			m_txd->Add(name, tex->GetTexture());
 
 			m_textures[name] = tex;
@@ -597,6 +666,7 @@ bool RuntimeTex::LoadImage(const char* fileName)
 	return false;
 }
 
+#ifdef GTA_FIVE
 #define VFS_GET_RAGE_PAGE_FLAGS 0x20001
 
 struct GetRagePageFlagsExtension
@@ -1070,6 +1140,7 @@ static hook::cdecl_stub<void*(fwEntityDef*, int fileIdx, fwArchetype* archetype,
 {
 	return hook::get_call(hook::pattern("4C 8D 4C 24 40 4D 8B C6 41 8B D7 48 8B CF").count(1).get(0).get<void>(14));
 });
+#endif
 
 static InitFunction initFunction([]()
 {
@@ -1109,6 +1180,7 @@ static InitFunction initFunction([]()
 		.AddMethod("SET_RUNTIME_TEXTURE_IMAGE", &RuntimeTex::LoadImage)
 		.AddMethod("COMMIT_RUNTIME_TEXTURE", &RuntimeTex::Commit);
 
+#ifdef GTA_FIVE
 	fx::ScriptEngine::RegisterNativeHandler("REGISTER_ARCHETYPES", [](fx::ScriptContext& context)
 	{
 		fx::OMPtr<IScriptRuntime> runtime;
@@ -1369,4 +1441,5 @@ static InitFunction initFunction([]()
 			}
 		});
 	});
+#endif
 });

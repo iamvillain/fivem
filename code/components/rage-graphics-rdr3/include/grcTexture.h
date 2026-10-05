@@ -26,6 +26,17 @@ namespace rage
 			{
 				return true;
 			}
+
+			// the width and height of the texture's ImageParams, at +0x18
+			inline uint16_t GetWidth()
+			{
+				return *reinterpret_cast<uint16_t*>(reinterpret_cast<char*>(this) + 0x18);
+			}
+
+			inline uint16_t GetHeight()
+			{
+				return *reinterpret_cast<uint16_t*>(reinterpret_cast<char*>(this) + 0x1A);
+			}
 		};
 
 		enum class BufferFormat : uint8_t
@@ -215,6 +226,9 @@ namespace rage
 		void GFX_EXPORT Driver_Create_ShaderResourceView(Texture* texture, const TextureViewDesc& desc);
 
 		void GFX_EXPORT Driver_Destroy_Texture(Texture* texture);
+
+		// swaps the textures' images, the way a higher detail version streams in
+		void GFX_EXPORT Driver_Swap_Textures(Texture* left, Texture* right);
 	}
 
 	// rage::grcImage, in reality
